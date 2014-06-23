@@ -1,0 +1,177 @@
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Linq;
+using System.Messaging;
+using System.ServiceProcess;
+using System.Text;
+using System.Threading;
+using log4net;
+
+namespace MessageConsumer
+{
+    public partial class ConsumerService : ServiceBase
+    {
+        ILog logger;
+
+        public ConsumerService()
+        {
+            logger = LogManager.GetLogger(GetType().FullName);
+            InitializeComponent();
+        }
+        /// <summary>
+        /// Implements service OnStop event
+        /// </summary>
+        protected override void OnStop()
+        {
+            logger.Warn(string.Format("Exiting service. Stop consuming messages..."));
+            base.OnStop();
+        }
+        /// <summary>
+        /// Implements service OnStart event
+        /// </summary>
+        /// <param name="args"></param>
+        protected override void OnStart(string[] args)
+        {
+            logger.Warn(string.Format("Entering service. Call message consumer..."));
+            ThreadPool.QueueUserWorkItem(new WaitCallback(MessageConsumer));
+        }
+        /// <summary>
+        /// Implements the message consuming process 
+        /// </summary>
+        /// <param name="obj"></param>
+        protected void MessageConsumer(object obj)
+        {
+            // Timeout
+            int timeOut;
+            if (!int.TryParse(ConfigurationManager.AppSettings["QueueTimeout"], out timeOut))
+                timeOut = 5000;
+            logger.Debug(string.Format("TimeOut={0}", timeOut));
+            // Queue name
+            string queueName = ConfigurationManager.AppSettings["QueueName"];
+            if (string.IsNullOrEmpty(queueName))
+                queueName = @".\private$\my_queue";
+            logger.Debug(string.Format("QueueName=\"{0}\"", queueName));
+            // Plugin path
+            string pluginPath = ConfigurationManager.AppSettings["PluginPath"];
+            if (string.IsNullOrEmpty(pluginPath))
+                pluginPath = @".\Output\Plugins";
+            logger.Debug(string.Format("PluginPath=\"{0}\"", pluginPath));
+            // Thread count
+            int threadCount = 1;
+            string threadCountAsString = ConfigurationManager.AppSettings["ThreadCount"];
+            if (!string.IsNullOrEmpty(threadCountAsString))
+                threadCount = int.Parse(threadCountAsString);
+
+            Console.WriteLine("Start consuming messages at queue=\"{0}\"", queueName);
+            logger.Info(string.Format("Start consuming messages at queue=\"{0}\"", queueName));
+            while (true)
+            {
+                try
+                {                    
+                    List<Thread> threads = new List<Thread>(threadCount);
+                    for (int i = 1; i <= threadCount; i++)
+                    {
+                        var threadReceiver = new ConsumerThread();
+                        Thread thread = threadReceiver.Start(string.Concat("T", i.ToString()), queueName, pluginPath);
+                        threads.Add(thread);
+                    }
+                    foreach (Thread thread in threads)
+                        thread.Join();
+                }
+                catch (Exception exc)
+                {
+                    Console.Error.WriteLine(exc);
+                    logger.Fatal("Failed consuming message", exc);
+                }
+                Console.WriteLine("Sleeping...");
+                Thread.Sleep(timeOut);
+            }        
+        }
+    }
+
+    /// <summary>
+    /// Thread consuming the messages in the queue
+    /// </summary>
+    class ConsumerThread
+    {
+        private ILog logger;
+
+        private Thread pThread = null;
+        private string queueName;
+        private string pluginPath;
+
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        public ConsumerThread()
+        {
+            logger = LogManager.GetLogger(GetType().FullName);
+        }
+        
+        /// <summary>
+        /// Start the thread
+        /// </summary>
+        /// <param name="threadName"></param>
+        /// <param name="queueName"></param>
+        /// <param name="pluginPath"></param>
+        /// <returns></returns>
+        internal Thread Start(string threadName, string queueName, string pluginPath)
+        {
+            this.queueName = queueName;
+            this.pluginPath = pluginPath;
+
+            ThreadStart threadStart = new System.Threading.ThreadStart(Run);
+            pThread = new Thread(threadStart);
+            pThread.Name = threadName;
+            pThread.Start();
+            return pThread;
+        }
+
+        /// <summary>
+        /// Execute the message consumption
+        /// </summary>
+        private void Run()
+        {
+            logger.Debug("New message from queue...");
+            Message msg = ReceiveQueueMessage(queueName);
+            Consume(msg, pluginPath);
+            logger.Debug("Message run out.");
+        }
+
+        /// <summary>
+        /// Calls the message receiver and returns the message from queue
+        /// </summary>
+        /// <param name="queueName"></param>
+        /// <returns></returns>
+        private Message ReceiveQueueMessage(string queueName)
+        {
+            var msgReceiver = new QueueMessaging.MessageReceiver();
+            return msgReceiver.ReceiveQueueMessage(queueName);
+        }
+        /// <summary>
+        /// Consumes the message by the available plugins
+        /// </summary>
+        /// <param name="msg"></param>
+        /// <param name="pluginPath"></param>
+        private void Consume(Message msg, string pluginPath)
+        {
+            logger.Debug("***********************************************************************");
+            logger.DebugFormat("Consuming the message, id={0}", (msg == null? "NONE" : msg.Id));
+
+            var plugins = PluginManager.Instance.GetAvailablePlugins();
+            foreach (var plugin in plugins)
+            {
+                try
+                {
+                    plugin.Consume(msg);
+                }
+                catch (Exception exc)
+                {
+                    Console.Error.WriteLine(exc.Message);
+                    logger.Error(exc);
+                }
+            }
+        }
+    }
+}
